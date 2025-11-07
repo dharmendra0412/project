@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Form Coach</title>
+    <!-- 1. Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 2. Load the MediaPipe vision library -->
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js"></script>
+    
+    <style>
+        /* Custom font */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Ensure canvas and video are perfectly overlaid */
+        #videoContainer {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            border-radius: 0.5rem;
+            overflow: hidden;
+        }
+        #webcam, #outputCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        /* Flip the video horizontally for a "mirror" effect */
+        #webcam {
+            transform: scaleX(-1);
+        }
+        #outputCanvas {
+            z-index: 10;
+            transform: scaleX(-1); /* <-- ADD THIS to flip the skeleton */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div class="w-full max-w-4xl mx-auto flex flex-col lg:flex-row gap-8">
+        
+        <!-- Left Column: Video Feed and Controls -->
+        <div class="flex-1 flex flex-col items-center">
+            <h1 class="text-3xl font-bold text-center mb-2">AI Form Coach</h1>
+            <p class="text-gray-400 text-center mb-4">Your personal squat and push-up assistant.</p>
+            
+            <!-- Add Exercise Selector -->
+            <div class="mb-4 w-full max-w-xs">
+                <label for="exerciseSelect" class="block text-sm font-medium text-gray-400">Select Exercise</label>
+                <select id="exerciseSelect" class="mt-1 block w-full bg-gray-700 border-gray-600 text-white rounded-lg p-2 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="squat">Squat</option>
+                    <option value="pushup">Push-up</option>
+                    <option value="pullup">Pull-up</option>
+                </select>
+            </div>
+
+            <div id="videoContainer" class="bg-gray-700">
+                <video id="webcam" autoplay playsinline></video>
+                <canvas id="outputCanvas"></canvas>
+            </div>
+            
+            <div class="mt-6 flex gap-4">
+                <button id="webcamButton" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-8 rounded-lg text-lg transition-all shadow-lg">
+                    Start Coaching
+                </button>
+                <button id="resetButton" class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-lg text-lg transition-all shadow-lg">
+                    Reset
+                </button>
+            </div>
+        </div>
+        
+        <!-- Right Column: Feedback Dashboard -->
+        <div class="w-full lg:w-1/3 bg-gray-800 rounded-lg p-6 shadow-2xl">
+            <h2 class="text-2xl font-semibold border-b border-gray-700 pb-2 mb-4">Live Feedback</h2>
+            
+            <div class="mb-6">
+                <p class="text-sm text-gray-400 uppercase tracking-wider">Rep Count</p>
+                <p id="repCount" class="text-6xl font-bold text-blue-400">0</p>
+            </div>
+            
+            <!-- NEW SECTION FOR ANGLE COMPARISON -->
+            <!-- REMOVED ANGLE DISPLAY BLOCK -->
+            <!-- END NEW SECTION -->
+
+            <div>
+                <p class="text-sm text-gray-400 uppercase tracking-wider">Form Correction</p>
+                <p id="feedbackText" class="text-2xl font-semibold text-yellow-300 h-24">
+                    Loading AI Model...
+                </p>
+            </div>
+
+            <div class="mt-6 pt-6 border-t border-gray-700">
+                <h3 class="text-lg font-semibold mb-2">How it works:</h3>
+                <p id="howItWorksText" class="text-gray-400 text-sm">
+                    Select an exercise. The app analyzes your body's key points to check your form.
+                </p>
+                <ul id="howItWorksList" class="list-disc list-inside text-gray-400 text-sm mt-2 space-y-1">
+                    <!-- This will be updated dynamically -->
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. The main application logic -->
+    <script type="module">
+        // Import necessary MediaPipe components
+        const { PoseLandmarker, FilesetResolver, DrawingUtils } = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.js");
+
+        // Get DOM elements
+        const video = document.getElementById("webcam");
+        const canvasElement = document.getElementById("outputCanvas");
+        const canvasCtx = canvasElement.getContext("2d");
+        const webcamButton = document.getElementById("webcamButton");
+        const resetButton = document.getElementById("resetButton");
+        const repCountElement = document.getElementById("repCount");
+        // REMOVED: const angleDisplayElement = document.getElementById("angleDisplay");
+        // REMOVED: const targetAngleDisplayElement = document.getElementById("targetAngleDisplay");
+        const feedbackTextElement = document.getElementById("feedbackText");
+        const exerciseSelect = document.getElementById("exerciseSelect"); // Added this
+        const howItWorksText = document.getElementById("howItWorksText");
+        const howItWorksList = document.getElementById("howItWorksList");
+
+        // --- Core Variables ---
+        let poseLandmarker;
+        let runningMode = "VIDEO";
+        let webcamRunning = false;
+        let drawingUtils;
+        let lastVideoTime = -1;
+
+        // --- Hackathon Logic Variables ---
+        let repCounter = 0;
+        let currentExercise = "squat"; // Added this
+        let squatState = "up"; // Can be 'up' or 'down'
+        let pushupState = "up"; // Added this. Can be 'up' or 'down'
+        let pullupState = "down"; // Added this. Can be 'up' or 'down' (start in 'down' state)
+        let feedback = "Click 'Start Coaching' to begin.";
+
+        // --- 1. Initialization: Load the AI Model ---
+        async function createPoseLandmarker() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+            );
+            
+            poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task`,
+                    delegate: "GPU"
+                },
+                runningMode: runningMode,
+                numPoses: 1, // We only want to track one person
+                minPoseDetectionConfidence: 0.8, // <-- INCREASED from 0.7 to 0.8
+                minTrackingConfidence: 0.8 // <-- INCREASED from 0.7 to 0.8
+            });
+            
+            drawingUtils = new DrawingUtils(canvasCtx);
+            feedbackTextElement.innerText = "Model ready. Click Start!";
+            webcamButton.disabled = false;
+            webcamButton.innerText = "Start Coaching";
+        }
+        
+        // Initialize model on page load
+        webcamButton.disabled = true;
+        updateHowItWorks(); // Initialize "How it works" text
+        createPoseLandmarker();
+
+        // --- 2. Event Listeners ---
+        webcamButton.addEventListener("click", enableCam);
+        resetButton.addEventListener("click", resetCounter);
+        exerciseSelect.addEventListener("change", selectExercise); // Added this
+
+        // --- New Function to handle exercise selection ---
+        function selectExercise() {
+            currentExercise = exerciseSelect.value;
+            updateHowItWorks();
+            resetCounter();
+            // REMOVED: angleDisplayElement.innerText = "--";
+            
+            if (webcamRunning) {
+                feedbackTextElement.innerText = `Position yourself for ${currentExercise}s.`;
+            }
+        }
+
+        // --- New Function to update the "How it works" panel ---
+        function updateHowItWorks() {
+            howItWorksList.innerHTML = ""; // Clear current list
+            if (currentExercise === 'squat') {
+                howItWorksText.innerText = "Analyzes shoulders, hips, and knees for squat form.";
+                // REMOVED: targetAngleDisplayElement.innerText = "< 100°";
+                ["Counts reps when you stand up.", "Checks for depth (hips below knees).", "Checks for back posture (chest up)."].forEach(text => {
+                    const li = document.createElement('li');
+                    li.textContent = text;
+                    howItWorksList.appendChild(li);
+                });
+            } else if (currentExercise === 'pushup') { // <-- THIS BLOCK WAS MISSING
+                howItWorksText.innerText = "Analyzes elbows, shoulders, and hips for push-up form.";
+                // REMOVED: targetAngleDisplayElement.innerText = "< 100°";
+                ["Counts reps when you push up.", "Checks for elbow bend (at bottom).", "Checks for straight back (plank)."].forEach(text => {
+                    const li = document.createElement('li');
+                    li.textContent = text;
+                    howItWorksList.appendChild(li);
+                });
+            } else if (currentExercise === 'pullup') {
+                howItWorksText.innerText = "Analyzes elbows, shoulders, and hips for pull-up form.";
+                // REMOVED: targetAngleDisplayElement.innerText = "< 90°";
+                ["Counts reps when you lower down.", "Checks for arm bend (at top).", "Checks for straight body (no kipping)."].forEach(text => {
+                    const li = document.createElement('li');
+                    li.textContent = text;
+                    howItWorksList.appendChild(li);
+                });
+            }
+        }
+
+        // --- Updated Function to Reset Counter ---
+        function resetCounter() {
+            repCounter = 0;
+            squatState = "up";
+            pushupState = "up"; // Added this
+            pullupState = "down"; // Added this
+            repCountElement.innerText = "0";
+            // REMOVED: angleDisplayElement.innerText = "--";
+            
+            if (!webcamRunning) {
+                feedbackTextElement.innerText = "Model ready. Click Start!";
+            } else {
+                feedbackTextElement.innerText = `Counter reset. Go for the next ${currentExercise}!`;
+            }
+        }
+
+        async function enableCam(event) {
+            if (!poseLandmarker) {
+                console.log("Wait! PoseLandmarker not loaded yet.");
+                return;
+            }
+
+            if (webcamRunning) {
+                // If webcam is on, turn it off
+                webcamRunning = false;
+                webcamButton.innerText = "Start Coaching";
+                video.pause();
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+                canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                feedbackTextElement.innerText = "Coaching paused.";
+                // REMOVED: angleDisplayElement.innerText = "--";
+            } else {
+                // If webcam is off, turn it on
+                webcamRunning = true;
+                webcamButton.innerText = "Stop Coaching";
+                feedbackTextElement.innerText = `Position yourself for ${currentExercise}s.`;
+
+                // Get user media
+                const constraints = { video: true };
+                navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+                    video.srcObject = stream;
+                    video.addEventListener("loadeddata", predictWebcam);
+                }).catch(err => {
+                    console.error("Error accessing webcam: ", err);
+                    feedbackTextElement.innerText = "Error: Webcam access denied.";
+                    webcamRunning = false;
+                    webcamButton.innerText = "Start Coaching";
+                });
+            }
+        }
+
+        // --- 3. The Prediction Loop ---
+        async function predictWebcam() {
+            // Set canvas size to match video
+            canvasElement.width = video.videoWidth;
+            canvasElement.height = video.videoHeight;
+
+            let startTimeMs = performance.now();
+            if (lastVideoTime !== video.currentTime && poseLandmarker) {
+                lastVideoTime = video.currentTime;
+                
+                // Perform pose detection
+                poseLandmarker.detectForVideo(video, startTimeMs, (results) => {
+                    // Clear the canvas
+                    canvasCtx.save();
+                    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                    
+                    if (results.landmarks && results.landmarks.length > 0) {
+                        const landmarks = results.landmarks[0];
+                        
+                        // Draw the skeleton (Improved "Gestures")
+                        drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
+                            color: '#00BFFF', // Changed to Deep Sky Blue (more "dark")
+                            lineWidth: 6 // Increased from 5 to 6
+                        });
+                        drawingUtils.drawLandmarks(landmarks, { 
+                            color: '#E0E0E0', // Slightly off-white
+                            radius: (data) => DrawingUtils.lerp(data.from.z, -0.15, 0.1, 5, 1) // Keep dynamic radius
+                        });
+                        
+                        // --- 4. Analyze the Pose (The "AI Coach") ---
+                        // analyzeSquat(landmarks); // Old call
+                        analyzePose(landmarks); // New dynamic call
+                    }
+                    canvasCtx.restore();
+                });
+            }
+
+            // Keep the loop going
+            if (webcamRunning) {
+                window.requestAnimationFrame(predictWebcam);
+            }
+        }
+        
+        // --- Helper function to calculate angle ---
+        function calculateAngle(p1, p2, p3) {
+            // Check for visibility
+            if (!p1 || !p2 || !p3 || p1.visibility < 0.5 || p2.visibility < 0.5 || p3.visibility < 0.5) {
+                return null; // Not enough data
+            }
+
+            let angle = Math.atan2(p3.y - p2.y, p3.x - p2.x) - Math.atan2(p1.y - p2.y, p1.x - p2.x);
+            angle = Math.abs(angle * (180.0 / Math.PI));
+            
+            if (angle > 180.0) {
+                angle = 360 - angle;
+            }
+            return angle;
+        }
+
+        // --- 4. NEW: Master Pose Analysis Function ---
+        function analyzePose(landmarks) {
+            if (currentExercise === 'squat') {
+                analyzeSquat(landmarks);
+            } else if (currentExercise === 'pushup') {
+                analyzePushup(landmarks);
+            } else if (currentExercise === 'pullup') {
+                analyzePullup(landmarks);
+            }
+        }
+
+        // --- 4a. The "AI Coach" Logic for Squats ---
+        function analyzeSquat(landmarks) {
+            // Get landmarks for one side (e.g., left)
+            const leftShoulder = landmarks[11];
+            const leftHip = landmarks[23];
+            const leftKnee = landmarks[25];
+            const leftAnkle = landmarks[27];
+
+            // Calculate key angles
+            // We use the 'y' coordinate to check for depth. Lower 'y' means higher up.
+            const hipY = leftHip.y;
+            const kneeY = leftKnee.y;
+
+            // Calculate angles for form check
+            const kneeAngle = calculateAngle(leftHip, leftKnee, leftAnkle);
+            const hipAngle = calculateAngle(leftShoulder, leftHip, leftKnee); // Measures back lean
+
+            // --- NEW: Update Angle Display ---
+            // REMOVED ANGLE DISPLAY LOGIC
+            // --- END NEW ---
+
+            let currentFeedback = "";
+
+            // --- Rep Counting Logic ---
+            // 1. Check if user is in the "down" position (squatting)
+            // We check if the hip is below the knee
+            if (hipY > kneeY && kneeAngle !== null && kneeAngle < 100) { // Added null check
+                squatState = "down";
+            }
+            
+            // 2. Check if user is in the "up" position (standing)
+            // And if they were previously in the "down" state
+            if (squatState === "down" && kneeAngle !== null && kneeAngle > 160) { // Added null check
+                squatState = "up";
+                repCounter++;
+                currentFeedback = "Good Rep!";
+            }
+
+            // --- Form Feedback Logic ---
+            // Provide feedback only when they are in the 'down' state
+            if (squatState === "down") {
+                if (hipY > (kneeY * 0.95)) { // 0.95 to give a little buffer
+                    currentFeedback = "Good Depth!";
+                } else {
+                    currentFeedback = "Go Deeper!";
+                }
+                
+                // Check back angle
+                if (hipAngle < 90) {
+                    currentFeedback += " Keep your chest up!";
+                }
+            } else {
+                // User is in the 'up' state
+                if (currentFeedback === "") { // Don't overwrite "Good Rep!"
+                   currentFeedback = "Go for the next rep!";
+                }
+            }
+            
+            // Update UI
+            repCountElement.innerText = repCounter;
+            feedbackTextElement.innerText = currentFeedback;
+        }
+
+        // --- 4b. NEW: The "AI Coach" Logic for Push-ups ---
+        function analyzePushup(landmarks) {
+            // Get landmarks for one side (e.g., left)
+            const leftShoulder = landmarks[11];
+            const leftElbow = landmarks[13];
+            const leftWrist = landmarks[15];
+            const leftHip = landmarks[23];
+            const leftKnee = landmarks[25]; // <-- ADDED
+
+            // Calculate key angles
+            const elbowAngle = calculateAngle(leftShoulder, leftElbow, leftWrist);
+            // const shoulderAngle = calculateAngle(leftElbow, leftShoulder, leftHip); // <-- This was the problem
+            const bodyAngle = calculateAngle(leftShoulder, leftHip, leftKnee); // <-- REPLACED: This checks for straight back
+
+            // --- NEW: Update Angle Display ---
+            // REMOVED ANGLE DISPLAY LOGIC
+            // --- END NEW ---
+
+            let currentFeedback = "";
+
+            // --- FIX: Add a "gate" to check if user is in push-up position ---
+            // If the body angle is not straight (e.g., < 150), they are probably not doing a push-up.
+            // Reset the state and don't count.
+            if (bodyAngle === null || bodyAngle < 150) {
+                pushupState = "up"; // Reset state
+                currentFeedback = "Get into a plank position.";
+                feedbackTextElement.innerText = currentFeedback;
+                // REMOVED: angleDisplayElement.innerText = "--";
+                // DO NOT update rep count, just return.
+                return;
+            }
+
+            // --- Rep Counting Logic (Only runs if body is straight) ---
+            // 1. Check if user is in the "down" position
+            if (elbowAngle !== null && elbowAngle < 100) { // Added null check
+                pushupState = "down";
+            }
+            
+            // 2. Check if user is in the "up" position
+            // And if they were previously in the "down" state
+            if (pushupState === "down" && elbowAngle !== null && elbowAngle > 160) { // Added null check
+                pushupState = "up";
+                repCounter++;
+                currentFeedback = "Good Rep!"; // This feedback has priority for 1 frame
+            }
+
+            // --- Form Feedback Logic (also only runs if body is straight) ---
+            // Form feedback has priority over "next rep" or "good rep"
+            if (bodyAngle < 160) { // Body angle should be ~180 (e.g., > 160)
+                currentFeedback = "Straighten your back!"; // <-- Priority feedback
+            } else if (pushupState === "down") {
+                if (currentFeedback === "") { // Don't overwrite "Straighten back!"
+                    currentFeedback = "Good Form! Push up!";
+                }
+            } else {
+                // User is in the 'up' state
+                if (currentFeedback === "") { // Don't overwrite "Good Rep!" or "Straighten back!"
+                   currentFeedback = "Go for the next rep!";
+                }
+            }
+            
+            // Update UI
+            repCountElement.innerText = repCounter;
+            feedbackTextElement.innerText = currentFeedback;
+        }
+
+        // --- 4c. NEW: The "AI Coach" Logic for Pull-ups ---
+        function analyzePullup(landmarks) {
+            // Get landmarks for one side (e.g., left)
+            const leftShoulder = landmarks[11];
+            const leftElbow = landmarks[13];
+            const leftWrist = landmarks[15];
+            const leftHip = landmarks[23];
+            const leftKnee = landmarks[25];
+
+            // Get 'y' coordinates for gate check
+            const shoulderY = leftShoulder ? leftShoulder.y : null;
+            const elbowY = leftElbow ? leftElbow.y : null;
+            const wristY = leftWrist ? leftWrist.y : null;
+
+            // Calculate key angles
+            const elbowAngle = calculateAngle(leftShoulder, leftElbow, leftWrist);
+            const bodyAngle = calculateAngle(leftShoulder, leftHip, leftKnee); // Checks for straight body (no kipping)
+
+            // --- NEW: Update Angle Display ---
+            // REMOVED ANGLE DISPLAY LOGIC
+            // --- END NEW ---
+
+            let currentFeedback = "";
+
+            // --- FIX: Add a "gate" to check if user is in pull-up position ---
+            // If the user is in a hanging position, their elbows and wrists should be 
+            // above their shoulders (i.e., lower 'y' value).
+            if (wristY === null || elbowY === null || shoulderY === null || wristY > shoulderY || elbowY > shoulderY) {
+                // Wrists or elbows are below shoulders, so user is not hanging.
+                pullupState = "down"; // Reset state
+                currentFeedback = "Position for pull-up (hang from bar).";
+                feedbackTextElement.innerText = currentFeedback;
+                // REMOVED: angleDisplayElement.innerText = "--";
+                return;
+            }
+
+            // --- Form Feedback (Priority) ---
+            if (bodyAngle && bodyAngle < 150) {
+                currentFeedback = "Keep your body straight!";
+            }
+            
+            // --- Rep Counting Logic (Only runs if user is hanging) ---
+            // 1. Check if user is in the "up" position (pulled up)
+            if (elbowAngle && elbowAngle < 90) {
+                pullupState = "up";
+                if (currentFeedback === "") { // Don't overwrite "straighten body"
+                    currentFeedback = "Good! Now lower down.";
+                }
+            }
+            
+            // 2. Check if user is in the "down" position (hanging)
+            // And if they were previously in the "up" state
+            if (pullupState === "up" && elbowAngle && elbowAngle > 160) {
+                pullupState = "down";
+                repCounter++;
+                currentFeedback = "Good Rep!"; // This feedback has priority for 1 frame
+            }
+
+            // --- Intermediate Feedback ---
+            if (currentFeedback === "") {
+                if (pullupState === "down") {
+                    if (elbowAngle && elbowAngle < 150) {
+                        currentFeedback = "Pull higher!";
+                    } else {
+                        currentFeedback = "Go for the next rep!";
+                    }
+                } else if (pullupState === "up") {
+                    if (elbowAngle && elbowAngle > 90) {
+                        currentFeedback = "Lower all the way down.";
+                    }
+                }
+            }
+            
+            // Handle case where angles can't be calculated
+            if (currentFeedback === "") {
+                currentFeedback = "Make sure your arms and body are visible.";
+            }
+
+            // Update UI
+            repCountElement.innerText = repCounter;
+            feedbackTextElement.innerText = currentFeedback;
+        }
+
+    </script>
+</body>
+</html>
